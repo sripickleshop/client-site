@@ -38,15 +38,15 @@ class AuthManager {
 
             if (authError) throw authError;
 
-            // Update profile with name and phone
+            // Update profile with name and phone (Upsert ensures it exists even if trigger failed)
             if (authData.user) {
                 const { error: profileError } = await this.supabase
                     .from('profiles')
-                    .update({
+                    .upsert({
+                        id: authData.user.id,
                         name: name,
                         phone: phone
-                    })
-                    .eq('id', authData.user.id);
+                    });
 
                 if (profileError) {
                     console.error('Error updating profile:', profileError);
