@@ -5,6 +5,10 @@
 const SUPABASE_URL = 'https://krdhwyhbagecgliabhxw.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtyZGh3eWhiYWdlY2dsaWFiaHh3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3NjQ3MzcsImV4cCI6MjA4NTM0MDczN30.f9a_Gz9Wt8_nnt0Dslww4JsuSVOOdgAS_CO3Zo8LTzA';
 
+// Expose to window for use in other scripts (e.g., payment functions)
+window.SUPABASE_URL = SUPABASE_URL;
+window.SUPABASE_ANON_KEY = SUPABASE_ANON_KEY;
+
 // Initialize Supabase Client
 function initializeSupabase() {
     if (typeof supabase !== 'undefined') {
