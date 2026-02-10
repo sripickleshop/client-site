@@ -2,9 +2,8 @@
 // This file uses the ANON key which is safe to expose in frontend
 
 // Supabase configuration
-window.SUPABASE_URL = 'https://krdhwyhbagecgliabhxw.supabase.co';
-window.SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtyZGh3eWhiYWdlY2dsaWFiaHh3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3NjQ3MzcsImV4cCI6MjA4NTM0MDczN30.f9a_Gz9Wt8_nnt0Dslww4JsuSVOOdgAS_CO3Zo8LTzA';
-const { SUPABASE_URL, SUPABASE_ANON_KEY } = window; // Keep local constants for compatibility in this file
+const SUPABASE_URL = 'https://krdhwyhbagecgliabhxw.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtyZGh3eWhiYWdlY2dsaWFiaHh3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3NjQ3MzcsImV4cCI6MjA4NTM0MDczN30.f9a_Gz9Wt8_nnt0Dslww4JsuSVOOdgAS_CO3Zo8LTzA';
 
 // Initialize Supabase Client
 function initializeSupabase() {

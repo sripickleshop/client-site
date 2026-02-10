@@ -158,7 +158,7 @@ window.showProductDetails = function (id) {
 }
 
 // Updated openProductModal with full functionality
-window.openProductModal = function (productId, skipPush = false) {
+window.openProductModal = function (productId) {
     const product = ProductService.getProductById(productId);
 
     if (!product) {
@@ -312,7 +312,7 @@ window.openProductModal = function (productId, skipPush = false) {
     document.body.style.overflow = 'hidden';
 
     // Push State to History
-    if (typeof skipPush !== 'undefined' && !skipPush) {
+    if (!skipPush) {
         HistoryManager.pushState({ product_id: productId });
     }
 
@@ -341,7 +341,7 @@ window.closeProductModal = function (skipPush = false) {
         currentTempSelection = { variantIndex: null, qty: 1 };
 
         // If closed manually (e.g. click "X"), update URL to remove param
-        if (typeof skipPush !== 'undefined' && skipPush === false) {
+        if (!skipPush) {
             HistoryManager.pushState({ product_id: null });
         }
     }
@@ -1395,17 +1395,8 @@ async function confirmOrderWithoutPayment() {
     showToast("Order saved! Details ready to send via WhatsApp or Email.");
 }
 
-// Payment functions removed for refactor
-// Legacy code cleared.
-
-// NEW PAYMENT SYSTEM INTEGRATION
-window.initiatePayment = async function () {
-    if (!validateShippingForm()) {
-        showToast("Please complete the shipping form correctly.");
-        return;
-    }
-
-    // Ensure Auth
+async function startPhonePeGatewayPayment() {
+    // ENFORCE AUTH
     const session = await window.authManager?.getSession();
     if (!session?.user && !window.currentUser) {
         showToast("Session expired. Please login again.");
@@ -1413,66 +1404,248 @@ window.initiatePayment = async function () {
         return;
     }
 
-    // Create Order Record First
+    if (!validateShippingForm()) return;
+
+    const selectedPaymentMethod = isMobileDevice() ? 'PhonePe' : 'PhonePe Gateway';
     const snapshot = getOrderSnapshot();
-    const orderDetails = {
-        total: snapshot.total,
-        subtotal: snapshot.subtotal,
-        gst: snapshot.gst,
-        shipping: snapshot.shipping,
-        discount: snapshot.discount || 0,
-        promo_code: snapshot.couponCode || null,
-        shippingAddress: shippingData,
-        billingAddress: window.billingDataIsSame ? shippingData : window.billingData, // Ensure billingData exists or fallback
-        items: CartService.getItems().map(item => ({
-            product_id: item.id,
-            name: item.name,
-            variantLabel: item.variantLabel,
-            quantity: item.qty,
-            price: item.price
-        })),
-        paymentMethod: 'PhonePe Gateway',
-        paymentStatus: 'pending'
-    };
+    const statusMsg = document.getElementById('payment-status-message');
 
-    let internalOrderId = null;
-    try {
-        if (!window.apiHelpers) throw new Error("API Helpers not ready");
-
-        showToast("Creating Order Record...", "info");
-        const { data: savedOrder, error } = await window.apiHelpers.createOrder(orderDetails);
-
-        if (error) throw new Error(error.message || "Failed to save order");
-        if (!savedOrder) throw new Error("No order returned");
-
-        internalOrderId = savedOrder.id;
-        console.log("Order Created:", internalOrderId);
-
-    } catch (e) {
-        console.error("Order Init Failed:", e);
-        showToast("Failed to initialize order. " + e.message, "error");
-        return;
+    if (statusMsg) {
+        statusMsg.innerText = 'Initializing Payment...';
+        statusMsg.classList.remove('hidden', 'bg-red-100', 'text-red-700');
+        statusMsg.classList.add('bg-blue-100', 'text-blue-700', 'block');
     }
 
-    const payload = {
-        total: snapshot.total,
-        shippingAddress: shippingData,
-        internalOrderId: internalOrderId
-    };
+    try {
+        // Check if we already have a pending order to retry
+        let orderId = localStorage.getItem('payment_pending_order_id');
 
-    if (window.PaymentService) {
-        window.PaymentService.initiatePayment(payload);
-    } else {
-        console.error("PaymentService not loaded");
-        showToast("System Error: Payment Service Unavailable");
+        if (!orderId) {
+            // 1. Create New Order in DB
+            // We don't show "Saving order details..." anymore to keep UI clean on failure
+            if (!window.apiHelpers) throw new Error('API Helper not initialized');
+
+            const orderData = {
+                total: snapshot.total,
+                subtotal: snapshot.subtotal,
+                gst: snapshot.gst,
+                shipping: snapshot.shipping,
+                discount: snapshot.discount || 0,
+                promo_code: snapshot.couponCode || null,
+                shippingAddress: shippingData,
+                billingAddress: window.billingDataIsSame ? shippingData : window.billingData,
+                items: CartService.getItems().map(item => ({
+                    product_id: item.id,
+                    name: item.name,
+                    variantLabel: item.variantLabel,
+                    quantity: item.qty,
+                    price: item.price
+                })),
+                paymentMethod: selectedPaymentMethod,
+                paymentStatus: 'pending_payment',
+                status: 'pending_payment'
+            };
+
+            const { data: savedOrder, error: dbError } = await window.apiHelpers.createOrder(orderData);
+
+            if (dbError) {
+                console.error('Order creation failed:', dbError);
+                // Throw generic error to avoid showing technical policy details to user
+                throw new Error('Could not initialize order. Please try again.');
+            }
+
+            orderId = savedOrder.id;
+
+            // Mark as Pending Payment for Restore/Retry
+            localStorage.setItem('payment_pending_order_id', orderId);
+
+            // Log Initiated
+            if (window.apiHelpers.logPaymentProcess) {
+                await window.apiHelpers.logPaymentProcess(orderId, 'INITIATED', 'PENDING', { amount: snapshot.total });
+            }
+        } else {
+            console.log('Retrying payment for existing Order ID:', orderId);
+        }
+
+        // 2. Initiate PhonePe Payment
+        if (statusMsg) statusMsg.innerText = 'Connecting to Secure Gateway...';
+
+        const response = await fetch(`${SUPABASE_URL}/functions/v1/phonepe-checkout`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+            },
+            body: JSON.stringify({
+                amount: snapshot.total,
+                orderId: orderId,
+                phone: shippingData.phone || "",
+                redirectUrl: window.location.href
+            })
+        });
+
+        const data = await response.json();
+
+        if (data && data.success && data.data?.instrumentResponse?.redirectInfo?.url) {
+            const redirectUrl = data.data.instrumentResponse.redirectInfo.url;
+
+            // Log Redirecting
+            if (window.apiHelpers.logPaymentProcess) {
+                await window.apiHelpers.logPaymentProcess(orderId, 'REDIRECTED', 'PENDING', { url: redirectUrl });
+            }
+
+            if (statusMsg) statusMsg.innerText = 'Opening Secure Gateway...';
+
+            // Show Gateway Modal and Load URL in Iframe
+            showPaymentGateway(redirectUrl);
+
+        } else {
+            throw new Error(data.message || 'Payment initiation failed');
+        }
+
+    } catch (error) {
+        console.error('Payment error:', error);
+        if (statusMsg) statusMsg.classList.add('hidden');
+
+        // Show specific error to user for debugging
+        showToast(error.message || "Payment initialization failed", 'error');
+
+        handlePaymentFailure();
+    }
+}
+
+window.showPaymentGateway = function (url) {
+    const modal = document.getElementById('payment-gateway-modal');
+    const iframe = document.getElementById('payment-gateway-iframe');
+    const loader = document.getElementById('payment-iframe-loader');
+
+    if (modal && iframe) {
+        loader.classList.remove('opacity-0', 'pointer-events-none');
+        iframe.src = url;
+        modal.classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+
+        // Refresh icons in modal
+        if (window.lucide) window.lucide.createIcons();
+    }
+};
+
+window.closePaymentGateway = function () {
+    const modal = document.getElementById('payment-gateway-modal');
+    const iframe = document.getElementById('payment-gateway-iframe');
+
+    if (confirm('Are you sure you want to exit the payment process? If you have completed the payment, please wait for redirection.')) {
+        if (modal) modal.classList.add('hidden');
+        if (iframe) iframe.src = 'about:blank';
+        document.body.style.overflow = '';
+
+        // Return to checkout step 2
+        document.getElementById('checkout-step-1').classList.add('hidden');
+        document.getElementById('checkout-step-2').classList.remove('hidden');
+    }
+};
+
+function handlePaymentFailure() {
+    document.getElementById('checkout-step-1').classList.add('hidden');
+    document.getElementById('checkout-step-2').classList.add('hidden');
+    document.getElementById('checkout-step-failed').classList.remove('hidden');
+    showToast('Payment was not completed.', 'error');
+}
+
+window.retryPayment = function () {
+    document.getElementById('checkout-step-failed').classList.add('hidden');
+    document.getElementById('checkout-step-2').classList.remove('hidden');
+    // Do NOT clear pending_order_id, so startPhonePeGatewayPayment reuses it.
+
+    // Scroll to options
+    const section = document.getElementById('payment-options-section');
+    if (section) section.scrollIntoView({ behavior: 'smooth' });
+};
+
+window.simulatePhonePeSuccess = async function () {
+    if (!validateShippingForm()) return;
+
+    const statusMsg = document.getElementById('payment-status-message');
+    if (statusMsg) {
+        statusMsg.innerText = 'Simulating Successful Payment...';
+        statusMsg.classList.remove('hidden', 'bg-red-100', 'text-red-700');
+        statusMsg.classList.add('bg-emerald-100', 'text-emerald-700', 'block');
+    }
+
+    try {
+        const snapshot = getOrderSnapshot();
+        let orderId = localStorage.getItem('payment_pending_order_id');
+
+        if (!orderId) {
+            // Create New Order
+            const orderData = {
+                total: snapshot.total,
+                subtotal: snapshot.subtotal,
+                gst: snapshot.gst,
+                shipping: snapshot.shipping,
+                discount: snapshot.discount || 0,
+                promo_code: snapshot.couponCode || null,
+                shippingAddress: shippingData,
+                billingAddress: window.billingDataIsSame ? shippingData : window.billingData,
+                items: CartService.getItems().map(item => ({
+                    product_id: item.id,
+                    name: item.name,
+                    variantLabel: item.variantLabel,
+                    quantity: item.qty,
+                    price: item.price
+                })),
+                paymentMethod: 'Simulation (PhonePe)',
+                paymentStatus: 'pending',
+                status: 'pending'
+            };
+
+            const { data: savedOrder, error: dbError } = await window.apiHelpers.createOrder(orderData);
+            if (dbError) throw dbError;
+            orderId = savedOrder.id;
+        }
+
+        // Simulate Success updates in DB
+        await window.apiHelpers.updateOrderPayment(orderId, 'SIM_PAY_12345', 'Simulation');
+
+        // Finalize UI display after simulation
+        document.getElementById('order-id').innerText = '#' + (orderId.substring(0, 8).toUpperCase());
+        document.getElementById('order-items-count').innerText = `${snapshot.totalQty} items`;
+        document.getElementById('order-total').innerText = `₹${snapshot.total.toFixed(2)}`;
+
+        // Show Success Step
+        document.getElementById('checkout-step-1').classList.add('hidden');
+        document.getElementById('checkout-step-2').classList.add('hidden');
+        document.getElementById('checkout-step-3').classList.remove('hidden');
+
+        // Scroll to top of modal for success message
+        const modal = document.getElementById('checkout-modal');
+        if (modal) modal.scrollTo({ top: 0, behavior: 'smooth' });
+
+        // Clear State
+        localStorage.removeItem('payment_pending_order_id');
+        clearCheckoutState();
+        CartService.clear();
+        updateCartUI();
+
+        showToast("Order placed successfully via simulation!", "success");
+
+    } catch (error) {
+        console.error('Simulation Error:', error);
+        const msg = (typeof error === 'string') ? error : (error.message || 'Unknown error occurred');
+        alert('Simulation failed: ' + msg);
     }
 };
 
 window.cancelPayment = async function () {
     if (confirm("Are you sure you want to cancel the order?")) {
-        // No local order ID deletion needed for new flow, just close UI
+        const orderId = localStorage.getItem('payment_pending_order_id');
+        if (orderId && window.apiHelpers) {
+            showToast('Cancelling Order...', 'info');
+            await window.apiHelpers.deleteOrder(orderId);
+            localStorage.removeItem('payment_pending_order_id');
+        }
         closeCheckout();
-        showToast('Payment Cancelled.');
+        showToast('Order Cancelled.');
     }
 };
 
@@ -1490,247 +1663,379 @@ window.closeCheckout = function (skipPush = false) {
         modal.classList.remove('flex');
         document.body.style.overflow = '';
 
-        if (typeof skipPush !== 'undefined' && skipPush === false) {
+        if (!skipPush) {
             HistoryManager.pushState({ modal: null });
         }
 
         // Reset to Step 1 if closed
         setTimeout(() => {
-            const s1 = document.getElementById('checkout-step-1');
-            const s2 = document.getElementById('checkout-step-2');
-            if (s1) s1.classList.remove('hidden');
-            if (s2) s2.classList.add('hidden');
+            document.getElementById('checkout-step-1').classList.remove('hidden');
+            document.getElementById('checkout-step-2').classList.add('hidden');
+            // Reset logic for pay button
+            const payBtn = document.getElementById('pay-now-btn');
+            if (payBtn) payBtn.classList.remove('hidden');
         }, 300);
-    };
+    }
+};
+// Helper to create or reuse order
+async function ensurePendingOrder(snapshot, paymentMethod) {
+    let orderId = localStorage.getItem('payment_pending_order_id');
 
-
-    // End of file cleanup
-    // (cancelPayment is defined above)
-
-
-    (function () {
-        const productModalEl = document.getElementById('product-modal');
-        if (productModalEl) {
-            productModalEl.addEventListener('click', function (e) {
-                if (e.target === this) {
-                    closeProductModal();
-                }
-            });
+    if (!orderId) {
+        showToast('Initializing Order...');
+        if (!window.apiHelpers) {
+            showToast('System Error', 'error');
+            return null;
         }
 
-        // QR File Input Listener
-        const qrFileInput = document.getElementById('qr-proof-file');
-        const qrBtn = document.getElementById('confirm-qr-btn');
-        if (qrFileInput && qrBtn) {
-            qrFileInput.addEventListener('change', function () {
-                if (this.files && this.files.length > 0) {
-                    qrBtn.disabled = false;
-                    qrBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                    document.getElementById('qr-upload-error').classList.add('hidden');
-                } else {
-                    qrBtn.disabled = true;
-                    qrBtn.classList.add('opacity-50', 'cursor-not-allowed');
-                }
-            });
-        }
-
-    })();
-
-    // Supabase ready handler moved to common-auth-ui.js
-    // But shop-specific logic (like loading products) should remain.
-    window.onSupabaseReady = (function (original) {
-        return function () {
-            if (original) original();
-            console.log('Shop: Supabase ready check.');
-
-            setTimeout(async () => {
-                updateCartUI();
-                if (typeof restoreCheckoutState === 'function') restoreCheckoutState();
-            }, 500);
+        const orderData = {
+            total: snapshot.total,
+            subtotal: snapshot.subtotal,
+            gst: snapshot.gst,
+            shipping: snapshot.shipping,
+            discount: snapshot.discount || 0,
+            promo_code: snapshot.couponCode || null,
+            shippingAddress: shippingData,
+            billingAddress: window.billingDataIsSame ? shippingData : window.billingData,
+            items: CartService.getItems().map(item => ({
+                product_id: item.id,
+                name: item.name,
+                variantLabel: item.variantLabel,
+                quantity: item.qty,
+                price: item.price
+            })),
+            paymentMethod: paymentMethod, // 'UPI Gateway'
+            paymentStatus: 'pending_payment',
+            status: 'pending_payment'
         };
-    })(window.onSupabaseReady);
 
-    function openBulkOrderForm() {
-        document.getElementById('bulk-order-modal').classList.remove('hidden');
-        document.body.style.overflow = 'hidden';
-    }
+        const { data: savedOrder, error: dbError } = await window.apiHelpers.createOrder(orderData);
 
-    function closeBulkOrderForm() {
-        document.getElementById('bulk-order-modal').classList.add('hidden');
-        document.body.style.overflow = '';
-        document.getElementById('bulk-order-form').reset();
-    }
-
-    function submitBulkOrder(e) {
-        e.preventDefault();
-        const name = document.getElementById('bulk-name').value;
-        const phone = document.getElementById('bulk-phone').value;
-        const email = document.getElementById('bulk-email').value;
-        const details = document.getElementById('bulk-details').value;
-
-        const body = `Bulk Order Inquiry\n\nName: ${name}\nPhone: ${phone}\nEmail: ${email}\n\nQuantity & Items Needed:\n${details}\n\nNote: This is a small business. Prices vary as raw ingredients are locally sourced. We will contact you with a custom quote.`;
-
-        if (STORE_WHATSAPP_NUMBER && STORE_WHATSAPP_NUMBER !== '91XXXXXXXXXX') {
-            const waUrl = `https://wa.me/${STORE_WHATSAPP_NUMBER}?text=${encodeURIComponent(body)}`;
-            window.open(waUrl, '_blank');
+        if (dbError) {
+            console.error('Order creation failed:', dbError);
+            showToast('Could not create order. Please try again.', 'error');
+            return null;
         }
 
-        if (STORE_EMAIL && STORE_EMAIL !== 'orders@example.com') {
-            const mailUrl = `mailto:${STORE_EMAIL}?subject=${encodeURIComponent('Bulk Order Inquiry - ' + name)}&body=${encodeURIComponent(body)}`;
-            window.location.href = mailUrl;
-        }
+        orderId = savedOrder.id;
+        localStorage.setItem('payment_pending_order_id', orderId);
 
-        showToast('Bulk order inquiry submitted! We will contact you soon.');
-        closeBulkOrderForm();
+        // Log Initiated
+        if (window.apiHelpers.logPaymentProcess) {
+            await window.apiHelpers.logPaymentProcess(orderId, 'INITIATED', 'PENDING', { method: paymentMethod, amount: snapshot.total });
+        }
+    }
+    return orderId;
+}
+
+// End of file cleanup
+// (cancelPayment is defined above)
+
+
+(function () {
+    const productModalEl = document.getElementById('product-modal');
+    if (productModalEl) {
+        productModalEl.addEventListener('click', function (e) {
+            if (e.target === this) {
+                closeProductModal();
+            }
+        });
     }
 
-    // Obsolete payment options display logic removed
+    // QR File Input Listener
+    const qrFileInput = document.getElementById('qr-proof-file');
+    const qrBtn = document.getElementById('confirm-qr-btn');
+    if (qrFileInput && qrBtn) {
+        qrFileInput.addEventListener('change', function () {
+            if (this.files && this.files.length > 0) {
+                qrBtn.disabled = false;
+                qrBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                document.getElementById('qr-upload-error').classList.add('hidden');
+            } else {
+                qrBtn.disabled = true;
+                qrBtn.classList.add('opacity-50', 'cursor-not-allowed');
+            }
+        });
+    }
 
+})();
 
-    /* --- UPDATED CHECKOUT LOGIC (APPENDED) --- */
+// Supabase ready handler moved to common-auth-ui.js
+// But shop-specific logic (like loading products) should remain.
+window.onSupabaseReady = (function (original) {
+    return function () {
+        if (original) original();
+        // Product loading is handled by the main loading block, but we can double check here
+        console.log('Shop: Supabase ready check.');
 
-    window.backToShipping = function () {
-        const s1 = document.getElementById('checkout-step-1');
-        const s2 = document.getElementById('checkout-step-2');
-        if (s1) s1.classList.remove('hidden');
-        if (s2) s2.classList.add('hidden');
-        const modalContent = document.querySelector('#checkout-modal > div');
-        if (modalContent) modalContent.scrollTo({ top: 0, behavior: 'smooth' });
+        // Wait for auth to be settled before final UI updates if needed (though common-ui handles dropdowns)
+        setTimeout(async () => {
+            updateCartUI();
+        }, 500);
     };
+})(window.onSupabaseReady);
 
-    // --- STATE PERSISTENCE ---
-    function saveCheckoutState() {
-        try {
-            const state = {
-                step: 2,
-                shippingData: shippingData,
-                timestamp: Date.now()
-            };
-            localStorage.setItem('checkout_state', JSON.stringify(state));
-        } catch (e) { console.error('Storage save error', e); }
+function openBulkOrderForm() {
+    document.getElementById('bulk-order-modal').classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+}
+
+function closeBulkOrderForm() {
+    document.getElementById('bulk-order-modal').classList.add('hidden');
+    document.body.style.overflow = '';
+    document.getElementById('bulk-order-form').reset();
+}
+
+function submitBulkOrder(e) {
+    e.preventDefault();
+    const name = document.getElementById('bulk-name').value;
+    const phone = document.getElementById('bulk-phone').value;
+    const email = document.getElementById('bulk-email').value;
+    const details = document.getElementById('bulk-details').value;
+
+    const body = `Bulk Order Inquiry\n\nName: ${name}\nPhone: ${phone}\nEmail: ${email}\n\nQuantity & Items Needed:\n${details}\n\nNote: This is a small business. Prices vary as raw ingredients are locally sourced. We will contact you with a custom quote.`;
+
+    if (STORE_WHATSAPP_NUMBER && STORE_WHATSAPP_NUMBER !== '91XXXXXXXXXX') {
+        const waUrl = `https://wa.me/${STORE_WHATSAPP_NUMBER}?text=${encodeURIComponent(body)}`;
+        window.open(waUrl, '_blank');
     }
 
-    function restoreCheckoutState() {
-        try {
-            const saved = localStorage.getItem('checkout_state');
-            if (!saved) return;
-            const state = JSON.parse(saved);
-            const now = Date.now();
-            if (now - state.timestamp > 3600000) {
-                localStorage.removeItem('checkout_state');
+    if (STORE_EMAIL && STORE_EMAIL !== 'orders@example.com') {
+        const mailUrl = `mailto:${STORE_EMAIL}?subject=${encodeURIComponent('Bulk Order Inquiry - ' + name)}&body=${encodeURIComponent(body)}`;
+        window.location.href = mailUrl;
+    }
+
+    showToast('Bulk order inquiry submitted! We will contact you soon.');
+    closeBulkOrderForm();
+}
+
+// Obsolete payment options display logic removed
+
+
+/* --- UPDATED CHECKOUT LOGIC (APPENDED) --- */
+
+// --- STATE PERSISTENCE ---
+function saveCheckoutState() {
+    try {
+        const state = {
+            step: 2,
+            shippingData: shippingData,
+            timestamp: Date.now()
+        };
+        localStorage.setItem('checkout_state', JSON.stringify(state));
+    } catch (e) { console.error('Storage save error', e); }
+}
+
+function clearCheckoutState() {
+    try { localStorage.removeItem('checkout_state'); } catch (e) { }
+}
+
+async function restoreCheckoutState() {
+    try {
+        // Ensure cart is loaded
+        if (typeof CartService === 'undefined') return;
+
+        const items = CartService.getItems();
+
+        // Check for Pending Payment (Return from Gateway or App Switch)
+        if (localStorage.getItem('payment_pending_order_id')) {
+            const orderId = localStorage.getItem('payment_pending_order_id');
+            const paymentType = localStorage.getItem('payment_method_type');
+
+            // If Manual UPI / QR Mode
+            if (paymentType === 'UPI_MANUAL') {
+                const modal = document.getElementById('checkout-modal');
+                if (modal) {
+                    modal.classList.remove('hidden');
+                    modal.classList.add('flex');
+                    openCheckout();
+                }
+                // Show QR UI directly
+                // We need amount... retrieve from order snapshot if possible or assume from cart (less safe but OK for restore)
+                // Better: fetch order details? For now, re-calc from cart is close enough.
+                const snapshot = getOrderSnapshot();
+                showQRPaymentUI(orderId, snapshot.total);
                 return;
             }
 
-            if (state.step === 2 && state.shippingData) {
-                shippingData = state.shippingData;
-                setTimeout(() => {
-                    if (window.CartService && !window.CartService.isEmpty()) {
-                        window.openCheckout(true);
-                        if (typeof transitionToReviewStep === 'function') transitionToReviewStep();
-                    }
-                }, 1500);
+            // Normal PhonePe Gateway Verification
+            const statusMsg = document.getElementById('payment-status-message');
+
+            // Show verifying UI
+            const modal = document.getElementById('checkout-modal');
+            if (modal) {
+                modal.classList.remove('hidden');
+                modal.classList.add('flex');
             }
-        } catch (e) { console.error('Restoration error', e); }
-    }
+            if (statusMsg) {
+                statusMsg.classList.remove('hidden', 'bg-red-100', 'text-red-700');
+                statusMsg.classList.add('bg-blue-100', 'text-blue-700', 'block');
+                statusMsg.innerText = 'Verifying Payment Status... Please wait.';
+            }
 
+            // Call Verification
+            if (window.apiHelpers) {
+                const { data, error } = await window.apiHelpers.verifyPaymentStatus(orderId);
 
+                // Log Verified
+                await window.apiHelpers.logPaymentProcess(orderId, 'VERIFIED', data?.status === 'completed' ? 'SUCCESS' : 'FAILED', data);
 
-    // --- CORE CHECKOUT FUNCTIONS ---
+                if (data && data.status === 'completed') {
+                    // Success!
+                    localStorage.removeItem('payment_pending_order_id');
+                    localStorage.removeItem('payment_method_type');
+                    clearCheckoutState();
 
-    async function goToPayment(e) {
-        if (e) e.preventDefault();
+                    // Show confirmation step
+                    document.getElementById('checkout-step-1').classList.add('hidden');
+                    document.getElementById('checkout-step-2').classList.add('hidden');
+                    document.getElementById('checkout-step-3').classList.remove('hidden');
 
-        // Secondary Auth Check
-        const session = await window.authManager?.getSession();
-        if (!session?.user && !window.currentUser) {
-            showToast("Session expired. Please login again.");
-            window.location.reload();
+                    document.getElementById('order-id').innerText = orderId;
+                    showToast('Payment Verified! Order Confirmed.');
+                    return;
+
+                } else if (data && data.status === 'pending') {
+                    statusMsg.innerText = 'Payment is still processing. Please check back later.';
+                    statusMsg.classList.add('bg-yellow-100', 'text-yellow-700');
+                } else {
+                    // Failed
+                    localStorage.removeItem('payment_pending_order_id');
+                    localStorage.removeItem('payment_method_type');
+                    handlePaymentFailure();
+                    if (statusMsg) statusMsg.innerText = 'Payment verification failed or was cancelled.';
+                }
+            }
+        }
+
+        const itemsCheck = CartService.getItems();
+        if (itemsCheck.length === 0) {
+            clearCheckoutState();
             return;
         }
 
-        if (selectedAddressId === 'new') {
-            const rawData = {
-                name: document.getElementById('shipping-name').value,
-                phone: document.getElementById('shipping-phone').value,
-                email: document.getElementById('shipping-email').value,
-                address: document.getElementById('shipping-address').value,
-                city: document.getElementById('shipping-city').value,
-                state: document.getElementById('shipping-state').value,
-                pincode: document.getElementById('shipping-pincode').value
-            };
+        const raw = localStorage.getItem('checkout_state');
+        if (!raw) return;
 
-            if (!rawData.name || !rawData.phone || !rawData.email || !rawData.address || !rawData.pincode) {
-                showToast('Please fill all required fields');
-                return;
-            }
-
-            // Save new address automatically
-            try {
-                if (window.apiHelpers.saveAddress) {
-                    const { data, error } = await window.apiHelpers.saveAddress({
-                        name: rawData.name,
-                        phone: rawData.phone,
-                        address: rawData.address,
-                        city: rawData.city,
-                        state: rawData.state,
-                        pincode: rawData.pincode,
-                        is_default: savedAddresses.length === 0
-                    });
-                }
-            } catch (err) { console.error(err); }
-
-            shippingData = rawData;
-
-        } else {
-            const addr = savedAddresses.find(a => a.id === selectedAddressId);
-            if (!addr) {
-                // Check if we already have data from restoration
-                if (!shippingData || !shippingData.name) {
-                    showToast('Please select an address');
-                    return;
-                }
-                // Using existing shippingData from restore
-            } else {
-                let email = document.getElementById('shipping-email').value;
-                // Try to fetch email from auth if missing
-                if (!email && window.authManager) {
-                    try {
-                        const { user } = await window.authManager.getSession();
-                        if (user) email = user.email;
-                    } catch (e) { }
-                }
-
-                shippingData = {
-                    name: addr.name,
-                    phone: addr.phone,
-                    email: email || 'No Email',
-                    address: addr.address,
-                    city: addr.city,
-                    state: addr.state,
-                    pincode: addr.pincode
-                };
-            }
+        const state = JSON.parse(raw);
+        // Expire after 24h
+        if (Date.now() - state.timestamp > 86400000) {
+            clearCheckoutState();
+            return;
         }
 
-        transitionToReviewStep();
-        saveCheckoutState();
+        if (state.step === 2 && state.shippingData) {
+            shippingData = state.shippingData;
+
+            // Pre-fill form but DO NOT auto-open modal on page load
+            // The modal will open when user clicks "Checkout", and data will be there.
+            const modal = document.getElementById('checkout-modal');
+            if (modal) {
+                // modal.classList.remove('hidden'); // Removed to prevent auto-opening
+                // modal.classList.add('flex');     // Removed to prevent auto-opening
+                // openCheckout(); // Do not auto-open the modal on page load
+                transitionToReviewStep(); // Still transition to review step to pre-fill data
+            }
+        }
+    } catch (e) { console.error('Restoration error', e); }
+}
+
+// --- CORE CHECKOUT FUNCTIONS ---
+
+async function goToPayment(e) {
+    if (e) e.preventDefault();
+
+    // Secondary Auth Check
+    const session = await window.authManager?.getSession();
+    if (!session?.user && !window.currentUser) {
+        showToast("Session expired. Please login again.");
+        window.location.reload();
+        return;
     }
 
-    function transitionToReviewStep() {
-        const step1 = document.getElementById('checkout-step-1');
-        const step2 = document.getElementById('checkout-step-2');
+    if (selectedAddressId === 'new') {
+        const rawData = {
+            name: document.getElementById('shipping-name').value,
+            phone: document.getElementById('shipping-phone').value,
+            email: document.getElementById('shipping-email').value,
+            address: document.getElementById('shipping-address').value,
+            city: document.getElementById('shipping-city').value,
+            state: document.getElementById('shipping-state').value,
+            pincode: document.getElementById('shipping-pincode').value
+        };
 
-        if (step1) step1.classList.add('hidden');
-        if (step2) step2.classList.remove('hidden');
+        if (!rawData.name || !rawData.phone || !rawData.email || !rawData.address || !rawData.pincode) {
+            showToast('Please fill all required fields');
+            return;
+        }
 
-        // 1. Populate Items
-        const items = CartService.getItems();
-        const reviewContainer = document.getElementById('review-items-container');
-        if (reviewContainer) {
-            if (items.length === 0) {
-                reviewContainer.innerHTML = '<p class="text-gray-500 italic">Cart is empty.</p>';
-            } else {
-                reviewContainer.innerHTML = items.map(item => `
+        // Save new address automatically
+        try {
+            if (window.apiHelpers.saveAddress) {
+                const { data, error } = await window.apiHelpers.saveAddress({
+                    name: rawData.name,
+                    phone: rawData.phone,
+                    address: rawData.address,
+                    city: rawData.city,
+                    state: rawData.state,
+                    pincode: rawData.pincode,
+                    is_default: savedAddresses.length === 0
+                });
+            }
+        } catch (err) { console.error(err); }
+
+        shippingData = rawData;
+
+    } else {
+        const addr = savedAddresses.find(a => a.id === selectedAddressId);
+        if (!addr) {
+            // Check if we already have data from restoration
+            if (!shippingData || !shippingData.name) {
+                showToast('Please select an address');
+                return;
+            }
+            // Using existing shippingData from restore
+        } else {
+            let email = document.getElementById('shipping-email').value;
+            // Try to fetch email from auth if missing
+            if (!email && window.authManager) {
+                try {
+                    const { user } = await window.authManager.getSession();
+                    if (user) email = user.email;
+                } catch (e) { }
+            }
+
+            shippingData = {
+                name: addr.name,
+                phone: addr.phone,
+                email: email || 'No Email',
+                address: addr.address,
+                city: addr.city,
+                state: addr.state,
+                pincode: addr.pincode
+            };
+        }
+    }
+
+    transitionToReviewStep();
+    saveCheckoutState();
+}
+
+function transitionToReviewStep() {
+    const step1 = document.getElementById('checkout-step-1');
+    const step2 = document.getElementById('checkout-step-2');
+
+    if (step1) step1.classList.add('hidden');
+    if (step2) step2.classList.remove('hidden');
+
+    // 1. Populate Items
+    const items = CartService.getItems();
+    const reviewContainer = document.getElementById('review-items-container');
+    if (reviewContainer) {
+        if (items.length === 0) {
+            reviewContainer.innerHTML = '<p class="text-gray-500 italic">Cart is empty.</p>';
+        } else {
+            reviewContainer.innerHTML = items.map(item => `
                 <div class="flex justify-between items-center border-b border-gray-200 last:border-0 pb-3 mb-2 last:mb-0 last:pb-0">
                     <div class="flex items-center gap-3">
                         <div class="bg-gray-100 text-gray-700 px-2 py-1 rounded text-xs font-bold whitespace-nowrap">${item.qty} x</div>
@@ -1742,21 +2047,21 @@ window.closeCheckout = function (skipPush = false) {
                     <div class="text-gray-900 font-bold text-sm">₹${(parseFloat(item.price) * parseInt(item.qty)).toFixed(2)}</div>
                 </div>
             `).join('');
-            }
-        } else {
-            console.error('Item Review Container not found!');
+        }
+    } else {
+        console.error('Item Review Container not found!');
+    }
+
+    // 2. Billing Info (Editable)
+    const billingContainer = document.getElementById('review-billing-info');
+    if (billingContainer) {
+        // Initialize billingData if not present
+        if (!window.billingData) {
+            window.billingData = {}; // Start empty to show placeholders
+            window.billingDataIsSame = true;
         }
 
-        // 2. Billing Info (Editable)
-        const billingContainer = document.getElementById('review-billing-info');
-        if (billingContainer) {
-            // Initialize billingData if not present
-            if (!window.billingData) {
-                window.billingData = {}; // Start empty to show placeholders
-                window.billingDataIsSame = true;
-            }
-
-            billingContainer.innerHTML = `
+        billingContainer.innerHTML = `
             <div class="flex items-center gap-2 mb-3">
                  <input type="checkbox" id="billing-same-as-shipping" class="text-spice-red rounded focus:ring-spice-red" ${window.billingDataIsSame ? 'checked' : ''} onchange="toggleBillingAddress(this.checked)">
                  <label for="billing-same-as-shipping" class="text-sm font-medium text-gray-700">Same as shipping address</label>
@@ -1787,12 +2092,12 @@ window.closeCheckout = function (skipPush = false) {
                  </div>
             </div>
         `;
-        }
+    }
 
-        // 3. Shipping Info
-        const shippingContainer = document.getElementById('review-shipping-info');
-        if (shippingContainer) {
-            shippingContainer.innerHTML = `
+    // 3. Shipping Info
+    const shippingContainer = document.getElementById('review-shipping-info');
+    if (shippingContainer) {
+        shippingContainer.innerHTML = `
             <div class="font-bold text-gray-800">${shippingData.name}</div>
             <div class="text-gray-600 text-xs">${shippingData.address}</div>
             <div class="text-gray-600 text-xs">${shippingData.city}, ${shippingData.state} - ${shippingData.pincode}</div>
@@ -1801,349 +2106,504 @@ window.closeCheckout = function (skipPush = false) {
                 <span class="flex items-center gap-1">Email: ${shippingData.email}</span>
             </div>
         `;
+    }
+
+    // 4. Update Totals
+    updateCheckoutTotals();
+
+    // 5. Reset Payment Button & Terms
+    const payBtn = document.getElementById('pay-now-btn');
+    const termsCheckbox = document.getElementById('terms-checkbox');
+
+    if (payBtn) {
+        payBtn.classList.remove('hidden');
+        payBtn.disabled = true;
+    }
+
+    if (termsCheckbox) {
+        termsCheckbox.checked = false;
+        // Clean event listener replacement
+        const newCheckbox = termsCheckbox.cloneNode(true);
+        if (termsCheckbox.parentNode) {
+            termsCheckbox.parentNode.replaceChild(newCheckbox, termsCheckbox);
         }
 
-        // 4. Update Totals
-        updateCheckoutTotals();
+        newCheckbox.addEventListener('change', function () {
+            const btn = document.getElementById('pay-now-btn');
+            if (!btn) return;
 
-        // 5. Reset Payment Button & Terms
-        const payBtn = document.getElementById('pay-now-btn');
-        const termsCheckbox = document.getElementById('terms-checkbox');
+            console.log('Terms checked:', this.checked);
 
-        if (payBtn) {
-            payBtn.classList.remove('hidden');
-            payBtn.disabled = true;
-        }
+            if (this.checked) {
+                // Validate billing data before allowing checkbox to remain checked
+                const isSameEl = document.getElementById('billing-same-as-shipping');
+                const isSame = isSameEl ? isSameEl.checked : true; // Default to true if not found to prevent blocking
 
-        if (termsCheckbox) {
-            termsCheckbox.checked = false;
-            // Clean event listener replacement
-            const newCheckbox = termsCheckbox.cloneNode(true);
-            if (termsCheckbox.parentNode) {
-                termsCheckbox.parentNode.replaceChild(newCheckbox, termsCheckbox);
-            }
-
-            newCheckbox.addEventListener('change', function () {
-                const btn = document.getElementById('pay-now-btn');
-                if (!btn) return;
-
-                console.log('Terms checked:', this.checked);
-
-                if (this.checked) {
-                    // Validate billing data before allowing checkbox to remain checked
-                    const isSameEl = document.getElementById('billing-same-as-shipping');
-                    const isSame = isSameEl ? isSameEl.checked : true; // Default to true if not found to prevent blocking
-
-                    if (isSame === false) {
-                        const data = getBillingData();
-                        if (!data.name || !data.address || !data.city || !data.pincode || !data.state || !data.phone) {
-                            showToast('Please complete all billing information fields first');
-                            this.checked = false;
-                            btn.disabled = true;
-                            btn.classList.add('opacity-50', 'cursor-not-allowed');
-                            return;
-                        }
+                if (isSame === false) {
+                    const data = getBillingData();
+                    if (!data.name || !data.address || !data.city || !data.pincode || !data.state || !data.phone) {
+                        showToast('Please complete all billing information fields first');
+                        this.checked = false;
+                        btn.disabled = true;
+                        btn.classList.add('opacity-50', 'cursor-not-allowed');
+                        return;
                     }
                 }
+            }
 
-                btn.disabled = !this.checked;
+            btn.disabled = !this.checked;
 
-                // Explicitly update classes to ensure visual state matches
-                if (this.checked) {
-                    btn.classList.remove('opacity-50', 'cursor-not-allowed');
-                    btn.classList.add('hover:bg-red-700', 'shadow-lg');
-                } else {
-                    btn.classList.add('opacity-50', 'cursor-not-allowed');
-                    btn.classList.remove('hover:bg-red-700', 'shadow-lg');
-                }
-            });
-        }
-
-        // Icons
-        if (window.lucide) window.lucide.createIcons();
+            // Explicitly update classes to ensure visual state matches
+            if (this.checked) {
+                btn.classList.remove('opacity-50', 'cursor-not-allowed');
+                btn.classList.add('hover:bg-red-700', 'shadow-lg');
+            } else {
+                btn.classList.add('opacity-50', 'cursor-not-allowed');
+                btn.classList.remove('hover:bg-red-700', 'shadow-lg');
+            }
+        });
     }
 
-    function updateCheckoutTotals() {
-        const { subtotal, gst, shipping, total: originalTotal } = CartService.getTotals();
+    // Icons
+    if (window.lucide) window.lucide.createIcons();
+}
 
-        let discount = 0;
-        if (appliedPromo) {
-            if (appliedPromo.discount_type === 'percentage') {
-                discount = (subtotal * (parseFloat(appliedPromo.discount_value) || 0)) / 100;
-            } else if (appliedPromo.discount_type === 'flat' || appliedPromo.discount_type === 'fixed') {
-                discount = parseFloat(appliedPromo.discount_value) || 0;
-            } else {
-                discount = (subtotal * (parseFloat(appliedPromo.discount_percent || appliedPromo.discount_value) || 0)) / 100;
-            }
-        }
+function updateCheckoutTotals() {
+    const { subtotal, gst, shipping, total: originalTotal } = CartService.getTotals();
 
-        const finalTotal = originalTotal - discount;
-
-        const set = (id, val) => {
-            const el = document.getElementById(id);
-            if (el) el.innerText = `₹${val.toFixed(2)}`;
-        };
-
-        set('checkout-subtotal', subtotal);
-        set('checkout-gst', gst);
-        set('checkout-shipping', shipping);
-
-        const totalEl = document.getElementById('checkout-total');
-        if (totalEl) {
-            if (discount > 0) {
-                totalEl.innerHTML = `<span class="text-sm line-through text-gray-400 mr-2">₹${originalTotal.toFixed(2)}</span> ₹${finalTotal.toFixed(2)}`;
-
-                // Show detailed discount row
-                const discRow = document.getElementById('checkout-discount-row');
-                const discLabel = document.getElementById('checkout-discount-label');
-                const discValue = document.getElementById('checkout-discount-value');
-                if (discRow && discLabel && discValue) {
-                    discRow.classList.remove('hidden');
-                    discLabel.innerText = `Discount (${appliedPromo.discount_percent}%) [${appliedPromo.code}]`;
-                    discValue.innerText = `-₹${discount.toFixed(2)}`;
-                }
-            } else {
-                totalEl.innerText = `₹${finalTotal.toFixed(2)}`;
-                const discRow = document.getElementById('checkout-discount-row');
-                if (discRow) discRow.classList.add('hidden');
-            }
-        }
-    }
-
-    window.applyPromoCode = async function () {
-        const input = document.getElementById('promo-code-input');
-        const message = document.getElementById('promo-message');
-        const removeBtn = document.getElementById('remove-promo-btn');
-        const applyBtn = input.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
-        const codeValue = input.value.trim();
-
-        if (!codeValue) {
-            showToast('Please enter a promo code');
-            return;
-        }
-
-        applyBtn.disabled = true;
-        applyBtn.innerText = 'Verifying...';
-
-        const { data, error } = await window.apiHelpers.validatePromoCode(codeValue);
-
-        if (error) {
-            message.innerText = error;
-            message.classList.remove('hidden', 'text-green-600');
-            message.classList.add('text-red-600');
-            input.classList.remove('border-gray-300', 'border-green-500');
-            input.classList.add('border-red-500');
-            appliedPromo = null;
-            applyBtn.disabled = false;
-            applyBtn.innerText = 'Apply';
+    let discount = 0;
+    if (appliedPromo) {
+        if (appliedPromo.discount_type === 'percentage') {
+            discount = (subtotal * (parseFloat(appliedPromo.discount_value) || 0)) / 100;
+        } else if (appliedPromo.discount_type === 'flat' || appliedPromo.discount_type === 'fixed') {
+            discount = parseFloat(appliedPromo.discount_value) || 0;
         } else {
-            message.innerText = `Success! ${data.name} applied (${data.discount_percent}% off)`;
-            message.classList.remove('hidden', 'text-red-600');
-            message.classList.add('text-green-600');
-            input.classList.remove('border-gray-300', 'border-red-500');
-            input.classList.add('border-green-500');
-
-            // Lock the field
-            input.readOnly = true;
-            input.classList.add('bg-gray-50', 'text-gray-500');
-
-            if (removeBtn) removeBtn.classList.remove('hidden');
-
-            applyBtn.disabled = true;
-            applyBtn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
-            applyBtn.classList.add('bg-gray-200', 'text-gray-400', 'cursor-not-allowed');
-            applyBtn.innerText = 'Applied';
-
-            appliedPromo = data;
-            showToast('Promo code applied!');
+            discount = (subtotal * (parseFloat(appliedPromo.discount_percent || appliedPromo.discount_value) || 0)) / 100;
         }
-        updateCheckoutTotals();
+    }
+
+    const finalTotal = originalTotal - discount;
+
+    const set = (id, val) => {
+        const el = document.getElementById(id);
+        if (el) el.innerText = `₹${val.toFixed(2)}`;
     };
 
-    window.removePromoCode = function () {
-        appliedPromo = null;
-        const input = document.getElementById('promo-code-input');
-        const message = document.getElementById('promo-message');
-        const removeBtn = document.getElementById('remove-promo-btn');
-        const applyBtn = input.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
+    set('checkout-subtotal', subtotal);
+    set('checkout-gst', gst);
+    set('checkout-shipping', shipping);
 
-        if (input) {
-            input.value = '';
-            input.readOnly = false;
-            input.classList.remove('bg-gray-50', 'text-gray-500', 'border-green-500', 'border-red-500');
-            input.classList.add('border-gray-300');
+    const totalEl = document.getElementById('checkout-total');
+    if (totalEl) {
+        if (discount > 0) {
+            totalEl.innerHTML = `<span class="text-sm line-through text-gray-400 mr-2">₹${originalTotal.toFixed(2)}</span> ₹${finalTotal.toFixed(2)}`;
+
+            // Show detailed discount row
+            const discRow = document.getElementById('checkout-discount-row');
+            const discLabel = document.getElementById('checkout-discount-label');
+            const discValue = document.getElementById('checkout-discount-value');
+            if (discRow && discLabel && discValue) {
+                discRow.classList.remove('hidden');
+                discLabel.innerText = `Discount (${appliedPromo.discount_percent}%) [${appliedPromo.code}]`;
+                discValue.innerText = `-₹${discount.toFixed(2)}`;
+            }
+        } else {
+            totalEl.innerText = `₹${finalTotal.toFixed(2)}`;
+            const discRow = document.getElementById('checkout-discount-row');
+            if (discRow) discRow.classList.add('hidden');
         }
-        if (message) message.classList.add('hidden');
-        if (removeBtn) removeBtn.classList.add('hidden');
+    }
+}
+
+window.applyPromoCode = async function () {
+    const input = document.getElementById('promo-code-input');
+    const message = document.getElementById('promo-message');
+    const removeBtn = document.getElementById('remove-promo-btn');
+    const applyBtn = input.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
+    const codeValue = input.value.trim();
+
+    if (!codeValue) {
+        showToast('Please enter a promo code');
+        return;
+    }
+
+    applyBtn.disabled = true;
+    applyBtn.innerText = 'Verifying...';
+
+    const { data, error } = await window.apiHelpers.validatePromoCode(codeValue);
+
+    if (error) {
+        message.innerText = error;
+        message.classList.remove('hidden', 'text-green-600');
+        message.classList.add('text-red-600');
+        input.classList.remove('border-gray-300', 'border-green-500');
+        input.classList.add('border-red-500');
+        appliedPromo = null;
+        applyBtn.disabled = false;
+        applyBtn.innerText = 'Apply';
+    } else {
+        message.innerText = `Success! ${data.name} applied (${data.discount_percent}% off)`;
+        message.classList.remove('hidden', 'text-red-600');
+        message.classList.add('text-green-600');
+        input.classList.remove('border-gray-300', 'border-red-500');
+        input.classList.add('border-green-500');
+
+        // Lock the field
+        input.readOnly = true;
+        input.classList.add('bg-gray-50', 'text-gray-500');
+
+        if (removeBtn) removeBtn.classList.remove('hidden');
+
+        applyBtn.disabled = true;
+        applyBtn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
+        applyBtn.classList.add('bg-gray-200', 'text-gray-400', 'cursor-not-allowed');
+        applyBtn.innerText = 'Applied';
+
+        appliedPromo = data;
+        showToast('Promo code applied!');
+    }
+    updateCheckoutTotals();
+};
+
+window.removePromoCode = function () {
+    appliedPromo = null;
+    const input = document.getElementById('promo-code-input');
+    const message = document.getElementById('promo-message');
+    const removeBtn = document.getElementById('remove-promo-btn');
+    const applyBtn = input.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
+
+    if (input) {
+        input.value = '';
+        input.readOnly = false;
+        input.classList.remove('bg-gray-50', 'text-gray-500', 'border-green-500', 'border-red-500');
+        input.classList.add('border-gray-300');
+    }
+    if (message) message.classList.add('hidden');
+    if (removeBtn) removeBtn.classList.add('hidden');
+    if (applyBtn) {
+        applyBtn.disabled = true;
+        applyBtn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
+        applyBtn.classList.add('bg-gray-200', 'text-gray-400');
+        applyBtn.innerText = 'Apply';
+    }
+    updateCheckoutTotals();
+    showToast('Promo code removed');
+};
+
+// Ensure Restore runs slightly after load
+setTimeout(() => {
+    restoreCheckoutState();
+}, 1000);
+
+// --- OVERRIDES FOR CLEARING STATE ---
+
+// Store original functions if needed or just replace
+const originalConfirmOrderWithoutPayment = window.confirmOrderWithoutPayment || confirmOrderWithoutPayment;
+
+window.confirmOrderWithoutPayment = async function () {
+    // Call original logic? We'll just copy the logic effectively or try to intercept.
+    // Since we appended, we can redefine.
+    // Redefining confirmOrderWithoutPayment entirely to ensure clearCheckoutState is called.
+
+    selectedPaymentMethod = 'Pay When Confirming Order';
+    const snapshot = getOrderSnapshot();
+    let orderId = `#ACH-2024-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const orderData = {
+        total: snapshot.total - (appliedPromo ? (snapshot.subtotal * appliedPromo.discount_percent) / 100 : 0),
+        subtotal: snapshot.subtotal,
+        gst: snapshot.gst,
+        shipping: snapshot.shipping,
+        discount: appliedPromo ? (snapshot.subtotal * appliedPromo.discount_percent) / 100 : 0,
+        promo_code: appliedPromo ? appliedPromo.code : null,
+        shippingAddress: shippingData,
+        billingAddress: typeof getBillingData === 'function' ? getBillingData() : shippingData,
+        items: CartService.getItems().map(item => ({
+            product_id: item.id,
+            name: item.name,
+            variantLabel: item.variantLabel,
+            variantIndex: item.variantIndex !== undefined ? item.variantIndex : 0,
+            quantity: item.qty,
+            price: item.price
+        })),
+        paymentMethod: selectedPaymentMethod,
+        paymentId: null,
+        paymentStatus: 'pending'
+    };
+
+    try {
+        const { data: savedOrder, error } = await window.apiHelpers.createOrder(orderData);
+        if (!error && savedOrder) {
+            orderId = savedOrder.order_number;
+        }
+    } catch (error) {
+        console.error('Error saving order:', error);
+    }
+
+    // Update UI for Success (Step 3)
+    document.getElementById('order-id').innerText = orderId;
+    document.getElementById('order-items-count').innerText = `${snapshot.totalQty} items`;
+    document.getElementById('order-total').innerText = `₹${snapshot.total.toFixed(2)}`;
+
+    // ... (Link generation code omitted for brevity, assuming existing HTML handles default hrefs if not updated) ...
+    // To match original functionality we should update links. 
+    // Simplified: Just show success.
+
+    document.getElementById('checkout-step-2').classList.add('hidden');
+    document.getElementById('checkout-step-3').classList.remove('hidden');
+
+    CartService.clear();
+    updateCartUI();
+    clearCheckoutState(); // <--- CRITICAL: Clear State
+    showToast("Order placed successfully!");
+};
+
+// Helper for toggling billing info
+window.toggleBillingAddress = function (isSame) {
+    window.billingDataIsSame = isSame;
+    const display = document.getElementById('billing-address-display');
+    const form = document.getElementById('billing-address-form');
+    const termsCheckbox = document.getElementById('terms-checkbox');
+    const payBtn = document.getElementById('pay-now-btn');
+
+    // If they change billing selection, reset terms/proceed to be safe
+    if (termsCheckbox) termsCheckbox.checked = false;
+    if (payBtn) payBtn.disabled = true;
+
+    if (isSame) {
+        if (display) display.classList.remove('hidden');
+        if (form) form.classList.add('hidden');
+        window.billingData = { ...shippingData };
+    } else {
+        if (display) display.classList.add('hidden');
+        if (form) form.classList.remove('hidden');
+    }
+};
+
+// Helper for extracting billing data explicitly when confirming order
+function getBillingData() {
+    if (window.billingDataIsSame) {
+        return shippingData;
+    } else {
+        return {
+            name: document.getElementById('billing-name')?.value || '',
+            address: document.getElementById('billing-address')?.value || '',
+            city: document.getElementById('billing-city')?.value || '',
+            pincode: document.getElementById('billing-pincode')?.value || '',
+            state: document.getElementById('billing-state')?.value || '',
+            phone: document.getElementById('billing-phone')?.value || '',
+            email: document.getElementById('shipping-email')?.value || shippingData.email || '' // Usually same email
+        };
+    }
+}
+
+function clearCheckoutState() {
+    localStorage.removeItem('checkout_state');
+    shippingData = {};
+    appliedPromo = null;
+    const promoMsg = document.getElementById('promo-message');
+    if (promoMsg) promoMsg.classList.add('hidden');
+    const promoInput = document.getElementById('promo-code-input');
+    if (promoInput) {
+        promoInput.value = '';
+        promoInput.readOnly = false;
+        promoInput.classList.remove('bg-gray-50', 'text-gray-500', 'border-green-500', 'border-red-500');
+        promoInput.classList.add('border-gray-300');
+        const applyBtn = promoInput.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
         if (applyBtn) {
             applyBtn.disabled = true;
             applyBtn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
             applyBtn.classList.add('bg-gray-200', 'text-gray-400');
             applyBtn.innerText = 'Apply';
         }
-        updateCheckoutTotals();
-        showToast('Promo code removed');
-    };
-
-
-
-    // --- OVERRIDES FOR CLEARING STATE ---
-
-    // Store original functions if needed or just replace
-    const originalConfirmOrderWithoutPayment = window.confirmOrderWithoutPayment || confirmOrderWithoutPayment;
-
-    window.confirmOrderWithoutPayment = async function () {
-        // Call original logic? We'll just copy the logic effectively or try to intercept.
-        // Since we appended, we can redefine.
-        // Redefining confirmOrderWithoutPayment entirely to ensure clearCheckoutState is called.
-
-        selectedPaymentMethod = 'Pay When Confirming Order';
-        const snapshot = getOrderSnapshot();
-        let orderId = `#ACH-2024-${Math.floor(1000 + Math.random() * 9000)}`;
-
-        const orderData = {
-            total: snapshot.total - (appliedPromo ? (snapshot.subtotal * appliedPromo.discount_percent) / 100 : 0),
-            subtotal: snapshot.subtotal,
-            gst: snapshot.gst,
-            shipping: snapshot.shipping,
-            discount: appliedPromo ? (snapshot.subtotal * appliedPromo.discount_percent) / 100 : 0,
-            promo_code: appliedPromo ? appliedPromo.code : null,
-            shippingAddress: shippingData,
-            billingAddress: typeof getBillingData === 'function' ? getBillingData() : shippingData,
-            items: CartService.getItems().map(item => ({
-                product_id: item.id,
-                name: item.name,
-                variantLabel: item.variantLabel,
-                variantIndex: item.variantIndex !== undefined ? item.variantIndex : 0,
-                quantity: item.qty,
-                price: item.price
-            })),
-            paymentMethod: selectedPaymentMethod,
-            paymentId: null,
-            paymentStatus: 'pending'
-        };
-
-        try {
-            const { data: savedOrder, error } = await window.apiHelpers.createOrder(orderData);
-            if (!error && savedOrder) {
-                orderId = savedOrder.order_number;
-            }
-        } catch (error) {
-            console.error('Error saving order:', error);
-        }
-
-        // Update UI for Success (Step 3)
-        document.getElementById('order-id').innerText = orderId;
-        document.getElementById('order-items-count').innerText = `${snapshot.totalQty} items`;
-        document.getElementById('order-total').innerText = `₹${snapshot.total.toFixed(2)}`;
-
-        // ... (Link generation code omitted for brevity, assuming existing HTML handles default hrefs if not updated) ...
-        // To match original functionality we should update links. 
-        // Simplified: Just show success.
-
-        document.getElementById('checkout-step-2').classList.add('hidden');
-        document.getElementById('checkout-step-3').classList.remove('hidden');
-
-        CartService.clear();
-        updateCartUI();
-        clearCheckoutState(); // <--- CRITICAL: Clear State
-        showToast("Order placed successfully!");
-    };
-
-    // Helper for toggling billing info
-    window.toggleBillingAddress = function (isSame) {
-        window.billingDataIsSame = isSame;
-        const display = document.getElementById('billing-address-display');
-        const form = document.getElementById('billing-address-form');
-        const termsCheckbox = document.getElementById('terms-checkbox');
-        const payBtn = document.getElementById('pay-now-btn');
-
-        // If they change billing selection, reset terms/proceed to be safe
-        if (termsCheckbox) termsCheckbox.checked = false;
-        if (payBtn) payBtn.disabled = true;
-
-        if (isSame) {
-            if (display) display.classList.remove('hidden');
-            if (form) form.classList.add('hidden');
-            window.billingData = { ...shippingData };
-        } else {
-            if (display) display.classList.add('hidden');
-            if (form) form.classList.remove('hidden');
-        }
-    };
-
-    // Helper for extracting billing data explicitly when confirming order
-    function getBillingData() {
-        if (window.billingDataIsSame) {
-            return shippingData;
-        } else {
-            return {
-                name: document.getElementById('billing-name')?.value || '',
-                address: document.getElementById('billing-address')?.value || '',
-                city: document.getElementById('billing-city')?.value || '',
-                pincode: document.getElementById('billing-pincode')?.value || '',
-                state: document.getElementById('billing-state')?.value || '',
-                phone: document.getElementById('billing-phone')?.value || '',
-                email: document.getElementById('shipping-email')?.value || shippingData.email || '' // Usually same email
-            };
-        }
+        const removeBtn = document.getElementById('remove-promo-btn');
+        if (removeBtn) removeBtn.classList.add('hidden');
     }
-
-    function clearCheckoutState() {
-        localStorage.removeItem('checkout_state');
-        shippingData = {};
-        appliedPromo = null;
-        const promoMsg = document.getElementById('promo-message');
-        if (promoMsg) promoMsg.classList.add('hidden');
-        const promoInput = document.getElementById('promo-code-input');
-        if (promoInput) {
-            promoInput.value = '';
-            promoInput.readOnly = false;
-            promoInput.classList.remove('bg-gray-50', 'text-gray-500', 'border-green-500', 'border-red-500');
-            promoInput.classList.add('border-gray-300');
-            const applyBtn = promoInput.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
-            if (applyBtn) {
-                applyBtn.disabled = true;
-                applyBtn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
-                applyBtn.classList.add('bg-gray-200', 'text-gray-400');
-                applyBtn.innerText = 'Apply';
-            }
-            const removeBtn = document.getElementById('remove-promo-btn');
-            if (removeBtn) removeBtn.classList.add('hidden');
-        }
-    }
-
-    // Logic for Promo button color and reveal payment
-    // Logic for Promo button color
-
-
-    // Feature: Download Invoice (Browser Print)
-    window.downloadInvoice = function () {
-        const orderId = document.getElementById('order-id')?.innerText || 'Order';
-        const total = document.getElementById('order-total')?.innerText || '0';
-        const items = document.getElementById('order-items-count')?.innerText || '0';
-
-        // Create a simple hidden printable area or just use current success screen
-        // For heritage feel, we'll suggest a standard print which handles the modal content.
-        window.print();
-        showToast('Opening print dialog for invoice...');
-    };
-
-    // Social listener for promo field input
-    document.addEventListener('input', (e) => {
-        if (e.target.id === 'promo-code-input') {
-            const btn = e.target.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
-            if (e.target.value.trim().length > 0) {
-                btn.disabled = false;
-                btn.classList.remove('bg-gray-200', 'text-gray-400');
-                btn.classList.add('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
-            } else {
-                btn.disabled = true;
-                btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
-                btn.classList.add('bg-gray-200', 'text-gray-400');
-            }
-        }
-    });
-
-
 }
+
+// Logic for Promo button color and reveal payment
+// Logic for Promo button color
+
+
+// Feature: Download Invoice (Browser Print)
+window.downloadInvoice = function () {
+    const orderId = document.getElementById('order-id')?.innerText || 'Order';
+    const total = document.getElementById('order-total')?.innerText || '0';
+    const items = document.getElementById('order-items-count')?.innerText || '0';
+
+    // Create a simple hidden printable area or just use current success screen
+    // For heritage feel, we'll suggest a standard print which handles the modal content.
+    window.print();
+    showToast('Opening print dialog for invoice...');
+};
+
+// Social listener for promo field input
+document.addEventListener('input', (e) => {
+    if (e.target.id === 'promo-code-input') {
+        const btn = e.target.closest('.flex').querySelector('button[onclick="applyPromoCode()"]');
+        if (e.target.value.trim().length > 0) {
+            btn.disabled = false;
+            btn.classList.remove('bg-gray-200', 'text-gray-400');
+            btn.classList.add('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
+        } else {
+            btn.disabled = true;
+            btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700', 'text-white');
+            btn.classList.add('bg-gray-200', 'text-gray-400');
+        }
+    }
+});
+
+/* --- UPDATED ORDER & PROOF LOGIC (APPENDED) --- */
+
+let currentOrderIdForProof = null;
+
+// Override: Pay Later / Manual Payment
+window.confirmOrderWithoutPayment = async function () {
+    selectedPaymentMethod = 'Pay When Confirming Order';
+    const snapshot = getOrderSnapshot();
+    let orderIdDisplay = `#ORD-${Math.floor(100000 + Math.random() * 900000)}`;
+    let realOrderId = null;
+
+    const orderData = {
+        total: snapshot.total,
+        subtotal: snapshot.subtotal,
+        gst: snapshot.gst,
+        shipping: snapshot.shipping,
+        shippingAddress: shippingData,
+        items: CartService.getItems().map(item => ({
+            product_id: item.id,
+            name: item.name,
+            variantLabel: item.variantLabel,
+            variantIndex: item.variantIndex !== undefined ? item.variantIndex : 0,
+            quantity: item.qty,
+            price: item.price
+        })),
+        paymentMethod: selectedPaymentMethod,
+        paymentId: null,
+        paymentStatus: 'pending'
+    };
+
+    try {
+        if (window.apiHelpers) {
+            const { data: savedOrder, error } = await window.apiHelpers.createOrder(orderData);
+            if (error) {
+                console.error('Error saving order:', error);
+                if (error.includes('User must be logged in')) {
+                    showToast('Please login to save order history', 'error');
+                } else {
+                    showToast('Failed to create order. Please try again.', 'error');
+                }
+                return; // STOP EXECUTION if order creation failed
+            } else if (savedOrder) {
+                orderIdDisplay = savedOrder.order_number || savedOrder.id;
+                realOrderId = savedOrder.id;
+                currentOrderIdForProof = savedOrder.id;
+            }
+        }
+    } catch (error) {
+        console.error('Error saving order:', error);
+        showToast('Connection error. Please try again.', 'error');
+        return; // STOP EXECUTION
+    }
+
+    // UI Updates
+    document.getElementById('order-id').innerText = orderIdDisplay;
+    document.getElementById('order-items-count').innerText = `${snapshot.totalQty} items`;
+    document.getElementById('order-total').innerText = `₹${snapshot.total.toFixed(2)}`;
+
+    // Transition to Step 3
+    document.getElementById('checkout-step-2').classList.add('hidden');
+    document.getElementById('checkout-step-3').classList.remove('hidden');
+
+    // Show Proof Section & Hide Success Actions initially
+    const proofSection = document.getElementById('payment-proof-section');
+    if (proofSection) {
+        proofSection.classList.remove('hidden');
+        const amtEl = document.getElementById('proof-amount');
+        if (amtEl) amtEl.innerText = `₹${snapshot.total.toFixed(2)}`;
+        proofSection.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    CartService.clear();
+    updateCartUI();
+    showToast("Order placed! Please upload your payment screenshot.");
+};
+
+// New: Upload Logic
+window.uploadPaymentProof = async function () {
+    if (!currentOrderIdForProof) {
+        showToast('Order ID missing. Cannot upload proof.', 'error');
+        return;
+    }
+
+    const fileInput = document.getElementById('proof-file');
+    const file = fileInput.files[0];
+    if (!file) {
+        showToast('Please select a screenshot/photo first.', 'error');
+        return;
+    }
+
+    // Validate size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+        showToast('File too large. Max 5MB.', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('upload-proof-btn');
+    const originalText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Uploading...`;
+    lucide.createIcons();
+
+    try {
+        const fileExt = file.name.split('.').pop();
+        const fileName = `${currentOrderIdForProof}_proof_${Date.now()}.${fileExt}`;
+        const filePath = `${fileName}`;
+
+        if (!window.supabaseClient) throw new Error("Supabase client not ready");
+
+        const { data, error } = await window.supabaseClient.storage
+            .from('order_proofs')
+            .upload(filePath, file);
+
+        if (error) throw error;
+
+        const { data: publicURLData } = window.supabaseClient.storage
+            .from('order_proofs')
+            .getPublicUrl(filePath);
+
+        const publicUrl = publicURLData.publicUrl;
+
+        // Update Order
+        const { error: updateError } = await window.supabaseClient
+            .from('shop_orders')
+            .update({ payment_proof_url: publicUrl })
+            .eq('id', currentOrderIdForProof);
+
+        if (updateError) throw updateError;
+
+        showToast('Proof uploaded successfully!', 'success');
+
+        // Show Success UI
+        document.getElementById('payment-proof-section').innerHTML = `
+            <div class="text-green-700 font-bold p-4 bg-green-50 rounded border border-green-200 text-center flex flex-col items-center gap-2">
+                <div class="bg-green-100 p-2 rounded-full"><i data-lucide="check-circle" class="w-8 h-8 text-green-600"></i></div>
+                <span>Proof Submitted! We will verify it shortly.</span>
+            </div>
+        `;
+        lucide.createIcons();
+
+    } catch (err) {
+        console.error('Upload failed:', err);
+        showToast('Failed to upload proof. ' + err.message, 'error');
+        btn.disabled = false;
+        btn.innerHTML = originalText;
+    }
+};
+
+// Override: PhonePe (Auto-Accept)
+// Final initializations
+confirmOrderWithoutPayment = window.confirmOrderWithoutPayment;
+startPhonePeGatewayPayment = window.startPhonePeGatewayPayment;
+uploadPaymentProof = window.uploadPaymentProof;
+
