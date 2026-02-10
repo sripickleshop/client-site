@@ -17,12 +17,6 @@
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
 
-    <!-- Razorpay Checkout -->
-    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
-
-    <!-- PhonePe Checkout -->
-    <script src="https://mercury.phonepe.com/web/bundle/checkout.js"></script>
-
     <!-- Supabase Client - Load first, then our scripts -->
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"
         onload="console.log('Supabase library loaded'); if (typeof supabase !== 'undefined') { console.log('Supabase available'); }"></script>
@@ -35,6 +29,7 @@
     <script src="js/services/UIService.js"></script>
     <script src="js/services/ProductService.js"></script>
     <script src="js/services/CartService.js"></script>
+    <script src="js/services/PaymentService.js"></script>
 
     <!-- Tailwind config moved to shop.js -->
 
@@ -618,61 +613,25 @@
                     </label>
                 </div>
 
-                <!-- Direct Pay Now Button (Replaces Dropdown) -->
-                <button onclick="startPhonePeGatewayPayment()" id="pay-now-btn" disabled
+                <!-- Direct Pay Now Button -->
+                <button onclick="initiatePayment()" id="pay-now-btn" disabled
                     class="w-full bg-spice-red text-white py-4 rounded-md font-bold text-lg hover:bg-red-700 transition-colors shadow-lg flex justify-center items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed transform active:scale-95 duration-200">
-                    Pay Now <i data-lucide="shield-check" class="w-5 h-5"></i>
+                    Pay Securely <i data-lucide="shield-check" class="w-5 h-5"></i>
                 </button>
 
                 <div id="payment-status-message" class="mt-4 p-3 rounded font-medium text-center hidden"></div>
             </div>
 
-            <!-- Manual UPI / QR Payment Step -->
-            <div id="checkout-step-qr" class="hidden p-6 text-center">
-                <div class="flex items-center justify-between mb-6 border-b pb-2">
-                    <h3 class="font-serif text-xl font-bold text-spice-red flex items-center gap-2">
-                        <i data-lucide="qr-code" class="w-6 h-6"></i> Scan & Pay
-                    </h3>
-                    <button onclick="closeQRPayment()"
-                        class="text-gray-500 hover:text-spice-red text-sm flex items-center gap-1">
-                        <i data-lucide="x" class="w-4 h-4"></i> Cancel
-                    </button>
-                </div>
-
-                <div class="space-y-4">
-                    <p class="text-sm text-gray-600">Scan the QR code in any UPI App to Pay</p>
-                    <div class="bg-white p-4 inline-block border-2 border-gray-100 rounded-xl shadow-sm">
-                        <!-- Placeholder QR - Dynamic Generation Ideally -->
-                        <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=upi://pay?pa=ajoyag06@oksbi&pn=SriPickles&am=0&cu=INR"
-                            alt="Payment QR Code" class="w-40 h-40 mx-auto" id="payment-qr-image">
-                    </div>
-
-                    <div class="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                        <p class="text-xs text-gray-500 uppercase font-bold tracking-wider mb-1">Shop UPI ID</p>
-                        <p class="font-mono font-bold text-gray-800" id="shop-upi-id-display">ajoyag06@oksbi</p>
-                    </div>
-
-                    <div class="pt-4 border-t border-gray-100 mt-4 text-left">
-                        <label class="block text-sm font-bold text-gray-700 mb-2">Upload Transaction Screenshot</label>
-                        <p class="text-xs text-gray-500 mb-3">Please upload the payment success screenshot to confirm
-                            your order.</p>
-
-                        <input type="file" id="qr-proof-file" accept="image/*" class="block w-full text-sm text-gray-500
-                            file:mr-4 file:py-2 file:px-4
-                            file:rounded-full file:border-0
-                            file:text-sm file:font-semibold
-                            file:bg-indigo-50 file:text-indigo-700
-                            hover:file:bg-indigo-100
-                         " />
-                        <div id="qr-upload-error" class="text-red-600 text-xs mt-2 hidden"></div>
-                    </div>
-
-                    <button onclick="submitQRPayment()" id="confirm-qr-btn" disabled
-                        class="w-full bg-green-600 text-white py-3 rounded-md font-bold hover:bg-green-700 transition-colors shadow-lg mt-4 flex justify-center items-center gap-2 opacity-50 cursor-not-allowed">
-                        Upload Proof & Confirm Order <i data-lucide="check-circle-2" class="w-4 h-4"></i>
-                    </button>
-                </div>
+            <!-- Verification Loader Step -->
+            <div id="checkout-step-verifying"
+                class="hidden p-10 text-center flex flex-col items-center justify-center h-full">
+                <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-spice-red mb-4"></div>
+                <h3 class="text-xl font-bold text-gray-800 mb-2">Verifying Payment...</h3>
+                <p class="text-gray-600 text-sm">Please do not close this window.</p>
             </div>
+
+            <!-- Removed Manual QR Step -->
+
 
             <!-- Step 3: Order Confirmation -->
             <div id="checkout-step-3" class="hidden text-center py-8 px-6">
@@ -763,7 +722,7 @@
                     connection and try again.</p>
 
                 <div class="flex flex-col gap-3 justify-center">
-                    <button onclick="retryPayment()"
+                    <button onclick="initiatePayment()"
                         class="w-full bg-indigo-600 text-white py-3 rounded-md font-bold hover:bg-indigo-700 transition-all shadow-md flex justify-center items-center gap-2">
                         <i data-lucide="refresh-cw" class="w-4 h-4"></i> Retry Payment
                     </button>

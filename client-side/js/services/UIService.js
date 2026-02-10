@@ -1,13 +1,28 @@
 
 window.UIService = {
-    showToast(message) {
+    showToast(message, type = 'success') {
         const container = document.getElementById('toast-container');
         if (!container) return; // Guard clause
 
         const toast = document.createElement('div');
         toast.className = "bg-gray-800 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-3 animate-toast-slide border-l-4 border-gold";
+
+        let icon = 'check-circle';
+        let iconColor = 'text-green-400';
+
+        if (type === 'error' || message.toLowerCase().includes('fail') || message.toLowerCase().includes('error') || message.toLowerCase().includes('cancel') || message.toLowerCase().includes('not completed')) {
+            icon = 'alert-circle';
+            iconColor = 'text-red-400';
+        } else if (type === 'info') {
+            icon = 'info';
+            iconColor = 'text-blue-400';
+        } else if (type === 'warning') {
+            icon = 'alert-triangle';
+            iconColor = 'text-yellow-400';
+        }
+
         toast.innerHTML = `
-            <i data-lucide="check-circle" class="w-5 h-5 text-green-400"></i>
+            <i data-lucide="${icon}" class="w-5 h-5 ${iconColor}"></i>
             <span class="text-sm font-semibold">${message}</span>
         `;
         container.appendChild(toast);

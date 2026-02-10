@@ -158,7 +158,7 @@ window.showProductDetails = function (id) {
 }
 
 // Updated openProductModal with full functionality
-window.openProductModal = function (productId, skipPush = false) {
+window.openProductModal = function (productId) {
     const product = ProductService.getProductById(productId);
 
     if (!product) {
@@ -312,7 +312,7 @@ window.openProductModal = function (productId, skipPush = false) {
     document.body.style.overflow = 'hidden';
 
     // Push State to History
-    if (typeof skipPush !== 'undefined' && !skipPush) {
+    if (!skipPush) {
         HistoryManager.pushState({ product_id: productId });
     }
 
@@ -341,7 +341,7 @@ window.closeProductModal = function (skipPush = false) {
         currentTempSelection = { variantIndex: null, qty: 1 };
 
         // If closed manually (e.g. click "X"), update URL to remove param
-        if (typeof skipPush !== 'undefined' && skipPush === false) {
+        if (!skipPush) {
             HistoryManager.pushState({ product_id: null });
         }
     }
@@ -1413,55 +1413,13 @@ window.initiatePayment = async function () {
         return;
     }
 
-    // Create Order Record First
-    const snapshot = getOrderSnapshot();
-    const orderDetails = {
-        total: snapshot.total,
-        subtotal: snapshot.subtotal,
-        gst: snapshot.gst,
-        shipping: snapshot.shipping,
-        discount: snapshot.discount || 0,
-        promo_code: snapshot.couponCode || null,
-        shippingAddress: shippingData,
-        billingAddress: window.billingDataIsSame ? shippingData : window.billingData, // Ensure billingData exists or fallback
-        items: CartService.getItems().map(item => ({
-            product_id: item.id,
-            name: item.name,
-            variantLabel: item.variantLabel,
-            quantity: item.qty,
-            price: item.price
-        })),
-        paymentMethod: 'PhonePe Gateway',
-        paymentStatus: 'pending'
-    };
-
-    let internalOrderId = null;
-    try {
-        if (!window.apiHelpers) throw new Error("API Helpers not ready");
-
-        showToast("Creating Order Record...", "info");
-        const { data: savedOrder, error } = await window.apiHelpers.createOrder(orderDetails);
-
-        if (error) throw new Error(error.message || "Failed to save order");
-        if (!savedOrder) throw new Error("No order returned");
-
-        internalOrderId = savedOrder.id;
-        console.log("Order Created:", internalOrderId);
-
-    } catch (e) {
-        console.error("Order Init Failed:", e);
-        showToast("Failed to initialize order. " + e.message, "error");
-        return;
-    }
-
-    const payload = {
-        total: snapshot.total,
-        shippingAddress: shippingData,
-        internalOrderId: internalOrderId
+    const orderData = {
+        total: getOrderSnapshot().total,
+        shippingAddress: shippingData
     };
 
     if (window.PaymentService) {
-        window.PaymentService.initiatePayment(payload);
+        window.PaymentService.initiatePayment(orderData);
     } else {
         console.error("PaymentService not loaded");
         showToast("System Error: Payment Service Unavailable");
@@ -1490,19 +1448,68 @@ window.closeCheckout = function (skipPush = false) {
         modal.classList.remove('flex');
         document.body.style.overflow = '';
 
-        if (typeof skipPush !== 'undefined' && skipPush === false) {
+        if (!skipPush) {
             HistoryManager.pushState({ modal: null });
         }
 
         // Reset to Step 1 if closed
         setTimeout(() => {
-            const s1 = document.getElementById('checkout-step-1');
-            const s2 = document.getElementById('checkout-step-2');
-            if (s1) s1.classList.remove('hidden');
-            if (s2) s2.classList.add('hidden');
-        }, 300);
-    };
+            document.getElementById('checkout-step-1').classList.remove('hidden');
+            document.getElementById('checkout-step-2').classList.add('hidden');
+            // Legacy button logic removed
 
+        }
+};
+    // Helper to create or reuse order
+    async function ensurePendingOrder(snapshot, paymentMethod) {
+        let orderId = localStorage.getItem('payment_pending_order_id');
+
+        if (!orderId) {
+            showToast('Initializing Order...');
+            if (!window.apiHelpers) {
+                showToast('System Error', 'error');
+                return null;
+            }
+
+            const orderData = {
+                total: snapshot.total,
+                subtotal: snapshot.subtotal,
+                gst: snapshot.gst,
+                shipping: snapshot.shipping,
+                discount: snapshot.discount || 0,
+                promo_code: snapshot.couponCode || null,
+                shippingAddress: shippingData,
+                billingAddress: window.billingDataIsSame ? shippingData : window.billingData,
+                items: CartService.getItems().map(item => ({
+                    product_id: item.id,
+                    name: item.name,
+                    variantLabel: item.variantLabel,
+                    quantity: item.qty,
+                    price: item.price
+                })),
+                paymentMethod: paymentMethod, // 'UPI Gateway'
+                paymentStatus: 'pending_payment',
+                status: 'pending_payment'
+            };
+
+            const { data: savedOrder, error: dbError } = await window.apiHelpers.createOrder(orderData);
+
+            if (dbError) {
+                console.error('Order creation failed:', dbError);
+                showToast('Could not create order. Please try again.', 'error');
+                return null;
+            }
+
+            orderId = savedOrder.id;
+            localStorage.setItem('payment_pending_order_id', orderId);
+
+            // Log Initiated
+            if (window.apiHelpers.logPaymentProcess) {
+                await window.apiHelpers.logPaymentProcess(orderId, 'INITIATED', 'PENDING', { method: paymentMethod, amount: snapshot.total });
+            }
+        }
+        return orderId;
+    }
 
     // End of file cleanup
     // (cancelPayment is defined above)
@@ -1541,11 +1548,12 @@ window.closeCheckout = function (skipPush = false) {
     window.onSupabaseReady = (function (original) {
         return function () {
             if (original) original();
+            // Product loading is handled by the main loading block, but we can double check here
             console.log('Shop: Supabase ready check.');
 
+            // Wait for auth to be settled before final UI updates if needed (though common-ui handles dropdowns)
             setTimeout(async () => {
                 updateCartUI();
-                if (typeof restoreCheckoutState === 'function') restoreCheckoutState();
             }, 500);
         };
     })(window.onSupabaseReady);
@@ -1589,15 +1597,6 @@ window.closeCheckout = function (skipPush = false) {
 
     /* --- UPDATED CHECKOUT LOGIC (APPENDED) --- */
 
-    window.backToShipping = function () {
-        const s1 = document.getElementById('checkout-step-1');
-        const s2 = document.getElementById('checkout-step-2');
-        if (s1) s1.classList.remove('hidden');
-        if (s2) s2.classList.add('hidden');
-        const modalContent = document.querySelector('#checkout-modal > div');
-        if (modalContent) modalContent.scrollTo({ top: 0, behavior: 'smooth' });
-    };
-
     // --- STATE PERSISTENCE ---
     function saveCheckoutState() {
         try {
@@ -1610,30 +1609,119 @@ window.closeCheckout = function (skipPush = false) {
         } catch (e) { console.error('Storage save error', e); }
     }
 
-    function restoreCheckoutState() {
+    function clearCheckoutState() {
+        try { localStorage.removeItem('checkout_state'); } catch (e) { }
+    }
+
+    async function restoreCheckoutState() {
         try {
-            const saved = localStorage.getItem('checkout_state');
-            if (!saved) return;
-            const state = JSON.parse(saved);
-            const now = Date.now();
-            if (now - state.timestamp > 3600000) {
-                localStorage.removeItem('checkout_state');
+            // Ensure cart is loaded
+            if (typeof CartService === 'undefined') return;
+
+            const items = CartService.getItems();
+
+            // Check for Pending Payment (Return from Gateway or App Switch)
+            if (localStorage.getItem('payment_pending_order_id')) {
+                const orderId = localStorage.getItem('payment_pending_order_id');
+                const paymentType = localStorage.getItem('payment_method_type');
+
+                // If Manual UPI / QR Mode
+                if (paymentType === 'UPI_MANUAL') {
+                    const modal = document.getElementById('checkout-modal');
+                    if (modal) {
+                        modal.classList.remove('hidden');
+                        modal.classList.add('flex');
+                        openCheckout();
+                    }
+                    // Show QR UI directly
+                    // We need amount... retrieve from order snapshot if possible or assume from cart (less safe but OK for restore)
+                    // Better: fetch order details? For now, re-calc from cart is close enough.
+                    const snapshot = getOrderSnapshot();
+                    showQRPaymentUI(orderId, snapshot.total);
+                    return;
+                }
+
+                // Normal PhonePe Gateway Verification
+                const statusMsg = document.getElementById('payment-status-message');
+
+                // Show verifying UI
+                const modal = document.getElementById('checkout-modal');
+                if (modal) {
+                    modal.classList.remove('hidden');
+                    modal.classList.add('flex');
+                }
+                if (statusMsg) {
+                    statusMsg.classList.remove('hidden', 'bg-red-100', 'text-red-700');
+                    statusMsg.classList.add('bg-blue-100', 'text-blue-700', 'block');
+                    statusMsg.innerText = 'Verifying Payment Status... Please wait.';
+                }
+
+                // Call Verification
+                if (window.apiHelpers) {
+                    const { data, error } = await window.apiHelpers.verifyPaymentStatus(orderId);
+
+                    // Log Verified
+                    await window.apiHelpers.logPaymentProcess(orderId, 'VERIFIED', data?.status === 'completed' ? 'SUCCESS' : 'FAILED', data);
+
+                    if (data && data.status === 'completed') {
+                        // Success!
+                        localStorage.removeItem('payment_pending_order_id');
+                        localStorage.removeItem('payment_method_type');
+                        clearCheckoutState();
+
+                        // Show confirmation step
+                        document.getElementById('checkout-step-1').classList.add('hidden');
+                        document.getElementById('checkout-step-2').classList.add('hidden');
+                        document.getElementById('checkout-step-3').classList.remove('hidden');
+
+                        document.getElementById('order-id').innerText = orderId;
+                        showToast('Payment Verified! Order Confirmed.');
+                        return;
+
+                    } else if (data && data.status === 'pending') {
+                        statusMsg.innerText = 'Payment is still processing. Please check back later.';
+                        statusMsg.classList.add('bg-yellow-100', 'text-yellow-700');
+                    } else {
+                        // Failed
+                        localStorage.removeItem('payment_pending_order_id');
+                        localStorage.removeItem('payment_method_type');
+                        handlePaymentFailure();
+                        if (statusMsg) statusMsg.innerText = 'Payment verification failed or was cancelled.';
+                    }
+                }
+            }
+
+            const itemsCheck = CartService.getItems();
+            if (itemsCheck.length === 0) {
+                clearCheckoutState();
+                return;
+            }
+
+            const raw = localStorage.getItem('checkout_state');
+            if (!raw) return;
+
+            const state = JSON.parse(raw);
+            // Expire after 24h
+            if (Date.now() - state.timestamp > 86400000) {
+                clearCheckoutState();
                 return;
             }
 
             if (state.step === 2 && state.shippingData) {
                 shippingData = state.shippingData;
-                setTimeout(() => {
-                    if (window.CartService && !window.CartService.isEmpty()) {
-                        window.openCheckout(true);
-                        if (typeof transitionToReviewStep === 'function') transitionToReviewStep();
-                    }
-                }, 1500);
+
+                // Pre-fill form but DO NOT auto-open modal on page load
+                // The modal will open when user clicks "Checkout", and data will be there.
+                const modal = document.getElementById('checkout-modal');
+                if (modal) {
+                    // modal.classList.remove('hidden'); // Removed to prevent auto-opening
+                    // modal.classList.add('flex');     // Removed to prevent auto-opening
+                    // openCheckout(); // Do not auto-open the modal on page load
+                    transitionToReviewStep(); // Still transition to review step to pre-fill data
+                }
             }
         } catch (e) { console.error('Restoration error', e); }
     }
-
-
 
     // --- CORE CHECKOUT FUNCTIONS ---
 
@@ -1985,7 +2073,10 @@ window.closeCheckout = function (skipPush = false) {
         showToast('Promo code removed');
     };
 
-
+    // Ensure Restore runs slightly after load
+    setTimeout(() => {
+        restoreCheckoutState();
+    }, 1000);
 
     // --- OVERRIDES FOR CLEARING STATE ---
 
@@ -2145,5 +2236,157 @@ window.closeCheckout = function (skipPush = false) {
         }
     });
 
+    /* --- UPDATED ORDER & PROOF LOGIC (APPENDED) --- */
 
-}
+    let currentOrderIdForProof = null;
+
+    // Override: Pay Later / Manual Payment
+    window.confirmOrderWithoutPayment = async function () {
+        selectedPaymentMethod = 'Pay When Confirming Order';
+        const snapshot = getOrderSnapshot();
+        let orderIdDisplay = `#ORD-${Math.floor(100000 + Math.random() * 900000)}`;
+        let realOrderId = null;
+
+        const orderData = {
+            total: snapshot.total,
+            subtotal: snapshot.subtotal,
+            gst: snapshot.gst,
+            shipping: snapshot.shipping,
+            shippingAddress: shippingData,
+            items: CartService.getItems().map(item => ({
+                product_id: item.id,
+                name: item.name,
+                variantLabel: item.variantLabel,
+                variantIndex: item.variantIndex !== undefined ? item.variantIndex : 0,
+                quantity: item.qty,
+                price: item.price
+            })),
+            paymentMethod: selectedPaymentMethod,
+            paymentId: null,
+            paymentStatus: 'pending'
+        };
+
+        try {
+            if (window.apiHelpers) {
+                const { data: savedOrder, error } = await window.apiHelpers.createOrder(orderData);
+                if (error) {
+                    console.error('Error saving order:', error);
+                    if (error.includes('User must be logged in')) {
+                        showToast('Please login to save order history', 'error');
+                    } else {
+                        showToast('Failed to create order. Please try again.', 'error');
+                    }
+                    return; // STOP EXECUTION if order creation failed
+                } else if (savedOrder) {
+                    orderIdDisplay = savedOrder.order_number || savedOrder.id;
+                    realOrderId = savedOrder.id;
+                    currentOrderIdForProof = savedOrder.id;
+                }
+            }
+        } catch (error) {
+            console.error('Error saving order:', error);
+            showToast('Connection error. Please try again.', 'error');
+            return; // STOP EXECUTION
+        }
+
+        // UI Updates
+        document.getElementById('order-id').innerText = orderIdDisplay;
+        document.getElementById('order-items-count').innerText = `${snapshot.totalQty} items`;
+        document.getElementById('order-total').innerText = `₹${snapshot.total.toFixed(2)}`;
+
+        // Transition to Step 3
+        document.getElementById('checkout-step-2').classList.add('hidden');
+        document.getElementById('checkout-step-3').classList.remove('hidden');
+
+        // Show Proof Section & Hide Success Actions initially
+        const proofSection = document.getElementById('payment-proof-section');
+        if (proofSection) {
+            proofSection.classList.remove('hidden');
+            const amtEl = document.getElementById('proof-amount');
+            if (amtEl) amtEl.innerText = `₹${snapshot.total.toFixed(2)}`;
+            proofSection.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        CartService.clear();
+        updateCartUI();
+        showToast("Order placed! Please upload your payment screenshot.");
+    };
+
+    // New: Upload Logic
+    window.uploadPaymentProof = async function () {
+        if (!currentOrderIdForProof) {
+            showToast('Order ID missing. Cannot upload proof.', 'error');
+            return;
+        }
+
+        const fileInput = document.getElementById('proof-file');
+        const file = fileInput.files[0];
+        if (!file) {
+            showToast('Please select a screenshot/photo first.', 'error');
+            return;
+        }
+
+        // Validate size (max 5MB)
+        if (file.size > 5 * 1024 * 1024) {
+            showToast('File too large. Max 5MB.', 'error');
+            return;
+        }
+
+        const btn = document.getElementById('upload-proof-btn');
+        const originalText = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = `<i data-lucide="loader-2" class="w-4 h-4 animate-spin"></i> Uploading...`;
+        lucide.createIcons();
+
+        try {
+            const fileExt = file.name.split('.').pop();
+            const fileName = `${currentOrderIdForProof}_proof_${Date.now()}.${fileExt}`;
+            const filePath = `${fileName}`;
+
+            if (!window.supabaseClient) throw new Error("Supabase client not ready");
+
+            const { data, error } = await window.supabaseClient.storage
+                .from('order_proofs')
+                .upload(filePath, file);
+
+            if (error) throw error;
+
+            const { data: publicURLData } = window.supabaseClient.storage
+                .from('order_proofs')
+                .getPublicUrl(filePath);
+
+            const publicUrl = publicURLData.publicUrl;
+
+            // Update Order
+            const { error: updateError } = await window.supabaseClient
+                .from('shop_orders')
+                .update({ payment_proof_url: publicUrl })
+                .eq('id', currentOrderIdForProof);
+
+            if (updateError) throw updateError;
+
+            showToast('Proof uploaded successfully!', 'success');
+
+            // Show Success UI
+            document.getElementById('payment-proof-section').innerHTML = `
+            <div class="text-green-700 font-bold p-4 bg-green-50 rounded border border-green-200 text-center flex flex-col items-center gap-2">
+                <div class="bg-green-100 p-2 rounded-full"><i data-lucide="check-circle" class="w-8 h-8 text-green-600"></i></div>
+                <span>Proof Submitted! We will verify it shortly.</span>
+            </div>
+        `;
+            lucide.createIcons();
+
+        } catch (err) {
+            console.error('Upload failed:', err);
+            showToast('Failed to upload proof. ' + err.message, 'error');
+            btn.disabled = false;
+            btn.innerHTML = originalText;
+        }
+    };
+
+    // Override: PhonePe (Auto-Accept)
+    // Final initializations
+    confirmOrderWithoutPayment = window.confirmOrderWithoutPayment;
+    startPhonePeGatewayPayment = window.startPhonePeGatewayPayment;
+    uploadPaymentProof = window.uploadPaymentProof;
+

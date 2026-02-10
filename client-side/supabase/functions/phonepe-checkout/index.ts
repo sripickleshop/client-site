@@ -1,74 +1,81 @@
-// Copy this entirely into your Supabase Edge Function Editor
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-}
+};
+
+const PHONEPE_PROD_URL = "https://api.phonepe.com/apis/hermes";
+const PHONEPE_SANDBOX_URL = "https://api-preprod.phonepe.com/apis/pg-sandbox";
 
 serve(async (req) => {
-  // Handle CORS preflight requests
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
 
   try {
-    const { amount, orderId, phone, redirectUrl } = await req.json()
-    
-    // These values will be pulled from 'Secrets' in Step 2 of Supabase deployment
-    const MID = Deno.env.get('PHONEPE_MERCHANT_ID')
-    const SALT = Deno.env.get('PHONEPE_SALT_KEY')
-    const INDEX = Deno.env.get('PHONEPE_SALT_INDEX') || "1"
-    const ENV = Deno.env.get('PHONEPE_ENVIRONMENT') || "SANDBOX" // change to PRODUCTION when live
+    const body = await req.json();
+    const { amount, orderId, phone, redirectUrl, userId } = body;
 
-    // Validate config
-    if (!MID || !SALT) {
-      throw new Error("Missing PhonePe Configuration (MID or SALT_KEY)");
-    }
+    const MID = Deno.env.get('PHONEPE_MERCHANT_ID');
+    const SALT = Deno.env.get('PHONEPE_SALT_KEY');
+    const INDEX = Deno.env.get('PHONEPE_SALT_INDEX') || "1";
+    const ENV = Deno.env.get('PHONEPE_ENVIRONMENT') || "SANDBOX";
 
-    const host = ENV === "PRODUCTION" 
-      ? "https://api.phonepe.com/apis/hermes" 
-      : "https://api-preprod.phonepe.com/apis/pg-sandbox"
+    if (!MID || !SALT) throw new Error("Missing PhonePe Configuration in Supabase Secrets");
 
+    const BASE_URL = ENV === 'PRODUCTION' ? PHONEPE_PROD_URL : PHONEPE_SANDBOX_URL;
+
+    // Build Payload
     const payload = {
       merchantId: MID,
       merchantTransactionId: orderId,
-      merchantUserId: "MUID" + Math.floor(Math.random() * 1000000),
-      amount: Math.round(amount * 100), // PhonePe expects amount in paise
-      redirectUrl: redirectUrl || "https://yourwebsite.com/shop.html", // Use client provided URL or fallback
-      redirectMode: "REDIRECT", // or "POST"
-      callbackUrl: redirectUrl || "https://yourwebsite.com/shop.html", // S2S Callback URL (Webhooks) - usually different, but for now reuse
-      mobileNumber: phone,
+      merchantUserId: userId || ("M-" + Math.random().toString(36).substring(7)),
+      amount: Math.round(amount * 100), // convert to paise
+      redirectUrl: redirectUrl,
+      redirectMode: "REDIRECT",
+      callbackUrl: `${Deno.env.get('SUPABASE_URL')}/functions/v1/phonepe-webhook`,
+      mobileNumber: phone || "9999999999",
       paymentInstrument: { type: "PAY_PAGE" }
+    };
+
+    const payloadBase64 = btoa(JSON.stringify(payload));
+    const stringToSign = payloadBase64 + "/pg/v1/pay" + SALT;
+
+    const encoder = new TextEncoder();
+    const hashBuffer = await crypto.subtle.digest("SHA-256", encoder.encode(stringToSign));
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join("");
+    const checksum = hashHex + "###" + INDEX;
+
+    console.log(`[PhonePe] Call: MID=${MID.substring(0, 6)}... Env=${ENV} Checksum=${hashHex.substring(0, 6)}...`);
+
+    const response = await fetch(`${BASE_URL}/pg/v1/pay`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-VERIFY": checksum,
+        "accept": "application/json"
+      },
+      body: JSON.stringify({ request: payloadBase64 })
+    });
+
+    const data = await response.json();
+    console.log(`[PhonePe Response] Status=${response.status} Code=${data.code} Message=${data.message || 'No message'}`);
+    if (!data.success) {
+      console.error(`[PhonePe Error Details]:`, JSON.stringify(data));
     }
 
-    const base64Payload = btoa(JSON.stringify(payload))
-    const string = base64Payload + "/pg/v1/pay" + SALT
-    
-    // Hash creation (CheckSum)
-    const encoder = new TextEncoder()
-    const data = encoder.encode(string)
-    const hashBuffer = await crypto.subtle.digest("SHA-256", data)
-    const hashArray = Array.from(new Uint8Array(hashBuffer))
-    const checksum = hashArray.map(b => b.toString(16).padStart(2, '0')).join('') + "###" + INDEX
-
-    const response = await fetch(`${host}/pg/v1/pay`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-VERIFY': checksum,
-        'accept': 'application/json'
-      },
-      body: JSON.stringify({ request: base64Payload })
-    })
-
-    const result = await response.json()
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    })
+    return new Response(JSON.stringify(data), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" }
+    });
 
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 400,
-    })
+    console.error("[Checkout Critical Error]:", error.message);
+    return new Response(JSON.stringify({ success: false, error: error.message }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+      status: 400
+    });
   }
-})
+});
