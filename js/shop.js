@@ -158,7 +158,7 @@ window.showProductDetails = function (id) {
 }
 
 // Updated openProductModal with full functionality
-window.openProductModal = function (productId) {
+window.openProductModal = function (productId, skipPush = false) {
     const product = ProductService.getProductById(productId);
 
     if (!product) {
@@ -312,7 +312,7 @@ window.openProductModal = function (productId) {
     document.body.style.overflow = 'hidden';
 
     // Push State to History
-    if (!skipPush) {
+    if (typeof skipPush !== 'undefined' && skipPush === false) {
         HistoryManager.pushState({ product_id: productId });
     }
 
@@ -1470,21 +1470,23 @@ async function startPhonePeGatewayPayment() {
         // 2. Initiate PhonePe Payment
         if (statusMsg) statusMsg.innerText = 'Connecting to Secure Gateway...';
 
-        const response = await fetch(`${SUPABASE_URL}/functions/v1/phonepe-checkout`, {
+        const response = await fetch(`${window.SUPABASE_URL}/functions/v1/phonepe-checkout`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+                'Authorization': `Bearer ${window.SUPABASE_ANON_KEY}`
             },
             body: JSON.stringify({
                 amount: snapshot.total,
                 orderId: orderId,
                 phone: shippingData.phone || "",
-                redirectUrl: window.location.href
+                redirectUrl: window.location.href,
+                userId: window.currentUser?.id
             })
         });
 
         const data = await response.json();
+        console.log('[PhonePe Client] Full Response:', JSON.stringify(data, null, 2));
 
         if (data && data.success && data.data?.instrumentResponse?.redirectInfo?.url) {
             const redirectUrl = data.data.instrumentResponse.redirectInfo.url;
@@ -1500,7 +1502,8 @@ async function startPhonePeGatewayPayment() {
             showPaymentGateway(redirectUrl);
 
         } else {
-            throw new Error(data.message || 'Payment initiation failed');
+            console.error('[PhonePe Client] Payment Failed:', data);
+            throw new Error(data.message || data.error || 'Payment initiation failed');
         }
 
     } catch (error) {
